@@ -1,6 +1,8 @@
 {
-  "source_path": "/home/ronysitepu/vibecoding/idx_downloader/idx-info-gatherer-xrks0/IDX_Downloads",
+  "source_path": "/home/ronysitepu/vibecoding/idx_downloader/idx-info-gatherer-xrks0/IDX_Downloads/source",
   "target_path": "/home/ronysitepu/vibecoding/idx_downloader/idx-info-gatherer-xrks0/IDX_Downloads/clean_docs",
-  "lookback_count": 50,
-  "file_types": [".pdf", ".xls", ".xlsx"]
+  "lookback_count": 500,
+  "file_types": [".pdf", ".xls", ".xlsx"],
+  "rclone_enabled": true,
+  "rclone_target": "gdrive:Vibe/IDX_Downloads_clean"
 }

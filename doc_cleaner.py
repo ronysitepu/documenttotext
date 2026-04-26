@@ -1,16 +1,30 @@
 import json
 import os
 import time
+import subprocess
 import pdfplumber
 import pandas as pd
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import openpyxl
 
+stats = {"processed": 0, "scans": 0, "skipped": 0}
+pending_sync = False
+last_processed_time = 0
 def process_pdf(file_path):
     data = {"text": "", "tables": []}
+    is_scan = False
     try:
         with pdfplumber.open(file_path) as pdf:
+            total_chars = 0
+            for page in pdf.pages[:3]:
+                text = page.extract_text()
+                if text:
+                    total_chars += len(text)
+            
+            if total_chars < 50:
+                return {"status": "manual_review_required", "reason": "scanned_document_detected"}, True
+                
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
@@ -20,7 +34,7 @@ def process_pdf(file_path):
                     data["tables"].extend(tables)
     except Exception as e:
         print(f"Error processing PDF {file_path}: {e}")
-    return data
+    return data, is_scan
 
 def process_excel(file_path):
     data = {}
@@ -36,20 +50,22 @@ def process_excel(file_path):
     return data
 
 def process_file(source_path, target_dir):
+    global stats
     filename = os.path.basename(source_path)
     ext = os.path.splitext(filename)[1].lower()
     
-    print(f"Processing: {filename}")
-    
-    # Check if target already exists to prevent duplicate processing
     target_path = os.path.join(target_dir, f"{filename}.json")
     if os.path.exists(target_path):
-        print(f"Skipping {filename}, already exists at {target_path}")
-        return
+        stats["skipped"] += 1
+        print(f"Processed: {stats['processed']} | Scans: {stats['scans']} | Skipped: {stats['skipped']}")
+        return False
         
+    print(f"Processing: {filename}")
+    
     data = None
+    is_scan = False
     if ext == ".pdf":
-        data = process_pdf(source_path)
+        data, is_scan = process_pdf(source_path)
     elif ext in [".xls", ".xlsx"]:
         data = process_excel(source_path)
         
@@ -57,12 +73,35 @@ def process_file(source_path, target_dir):
         os.makedirs(target_dir, exist_ok=True)
         with open(target_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"Successfully processed and saved: {target_path}")
+        
+        if is_scan:
+            stats["scans"] += 1
+        else:
+            stats["processed"] += 1
+            
+        print(f"Processed: {stats['processed']} | Scans: {stats['scans']} | Skipped: {stats['skipped']}")
+        return True
+    return False
+
+def run_rclone(config):
+    if config.get("rclone_enabled"):
+        target_path = config.get("target_path")
+        rclone_target = config.get("rclone_target")
+        if target_path and rclone_target:
+            try:
+                subprocess.run(
+                    ["rclone", "copy", target_path, rclone_target, "--include", "*.json"],
+                    check=False,
+                    capture_output=True
+                )
+            except Exception as e:
+                print(f"Rclone sync failed: {e}")
 
 class DocumentHandler(FileSystemEventHandler):
-    def __init__(self, target_dir, file_types):
+    def __init__(self, target_dir, file_types, config):
         self.target_dir = target_dir
         self.file_types = file_types
+        self.config = config
 
     def on_created(self, event):
         if not event.is_directory:
@@ -73,11 +112,13 @@ class DocumentHandler(FileSystemEventHandler):
             self.handle_file(event.dest_path)
             
     def handle_file(self, file_path):
+        global pending_sync, last_processed_time
         ext = os.path.splitext(file_path)[1].lower()
         if ext in self.file_types:
-            # Short sleep to allow the system to finish writing the file
             time.sleep(2)
-            process_file(file_path, self.target_dir)
+            if process_file(file_path, self.target_dir):
+                pending_sync = True
+                last_processed_time = time.time()
 
 def main():
     # Load config
@@ -105,29 +146,33 @@ def main():
     # Sort by 'date modified' (newest first)
     files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     
-    to_process = []
-    for f in files:
-        if len(to_process) >= lookback_count:
-            break
-        original_name = os.path.basename(f)
-        out_path = os.path.join(target_path, f"{original_name}.json")
-        if not os.path.exists(out_path):
-            to_process.append(f)
+    to_process = files[:lookback_count]
             
-    print(f"Found {len(to_process)} new files to process out of top {lookback_count} newest.")
+    print(f"Found {len(to_process)} newest files to evaluate.")
+    processed_any = False
     for f in to_process:
-        process_file(f, target_path)
+        if process_file(f, target_path):
+            processed_any = True
+            
+    if processed_any:
+        run_rclone(config)
         
     print("\n--- Phase 2: The Listener ---")
-    event_handler = DocumentHandler(target_path, file_types)
+    event_handler = DocumentHandler(target_path, file_types, config)
     observer = Observer()
     observer.schedule(event_handler, source_path, recursive=False)
     observer.start()
     print(f"Started monitoring '{source_path}' for new documents...")
     
+    global pending_sync, last_processed_time
     try:
         while True:
             time.sleep(1)
+            # Batch sync logic: if pending and 10 seconds of inactivity detected
+            if pending_sync and (time.time() - last_processed_time > 10):
+                print("\n--- Batch Sync Triggered (Inactivity) ---")
+                run_rclone(config)
+                pending_sync = False
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
